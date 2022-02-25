@@ -44,11 +44,17 @@ def main(args):
     log.info('Loading embeddings...')
     word_vectors = util.torch_from_json(args.word_emb_file)
 
+    # ADDED
+    char_vectors = util.torch_from_json(args.char_emb_file)
+
     # Get model
     log.info('Building model...')
     model = BiDAF(word_vectors=word_vectors,
+                  with_char_embed=False,  # TOGGLE THIS TO BE TRUE OR FALSE FOR CHARACTER EMBEDS
+                  char_vectors=char_vectors,
                   hidden_size=args.hidden_size,
                   drop_prob=args.drop_prob)
+
     model = nn.DataParallel(model, args.gpu_ids)
     if args.load_path:
         log.info(f'Loading checkpoint from {args.load_path}...')

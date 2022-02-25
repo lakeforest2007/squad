@@ -12,6 +12,35 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from util import masked_softmax
 
 
+# ADDED CHARACTER EMBEDDING LAYER
+class CharEmbedding(nn.Module):
+    """
+    Notes: 2D CNN with adaptive max-pooling
+    """
+    def __init__(self, char_vectors, hidden_size, drop_prob):
+        super(CharEmbedding, self).__init__()
+        self.drop_prob = drop_prob
+        # use pre-trained character vectors loaded in from json files
+        self.char_embed = nn.Embedding.from_pretrained(char_vectors)
+        self.cnn = nn.Conv2d(in_channels=char_vectors.shape[1],  # size of a character embedded vector
+                             out_channels=hidden_size,
+                             kernel_size=(1, 5))  # m is 1, width of filter is 5
+        # CNN returns 4D output -> (batch_size, hidden_size, seq_len, W_out)
+        # Reduce dimensionality from 4D to 3D with max pooling
+        self.max_pool = nn.AdaptiveMaxPool2d(output_size=(None, 1))  # TODO double check
+
+    def forward(self, x):
+        # get character embeddings from x
+        char_emb = self.char_embed(x)
+        # apply dropout
+        char_emb = F.dropout(char_emb, self.drop_prob, self.training)
+        # apply CNN
+        char_emb = self.cnn(char_emb)
+        # apply max-pool
+        char_emb = self.max_pool(char_emb).squeeze(dim=3)
+        return char_emb
+
+
 class Embedding(nn.Module):
     """Embedding layer used by BiDAF, without the character-level component.
 
