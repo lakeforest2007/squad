@@ -34,14 +34,19 @@ class BiDAF(nn.Module):
         
         # ADDED - Character Embedding Layer
         self.with_char_embed = with_char_embed
+
         if with_char_embed:
             self.char_emb = layers.CharEmbedding(char_vectors=char_vectors,
-                                                 hidden_size=hidden_size,
+                                                 out_channels=hidden_size,
                                                  drop_prob=drop_prob)
+            # double this because character level embeddings adds an additional 100 to hidden_size
         
         self.emb = layers.Embedding(word_vectors=word_vectors,
                                     hidden_size=hidden_size,
                                     drop_prob=drop_prob)
+
+        if with_char_embed:
+            hidden_size += hidden_size
 
         self.enc = layers.RNNEncoder(input_size=hidden_size,
                                      hidden_size=hidden_size,
@@ -51,7 +56,15 @@ class BiDAF(nn.Module):
         self.att = layers.BiDAFAttention(hidden_size=2 * hidden_size,
                                          drop_prob=drop_prob)
 
-        self.mod = layers.RNNEncoder(input_size=8 * hidden_size,
+        # ADDED
+        self.satt = layers.SelfAttention(hidden_size=2 * hidden_size,
+                                         drop_prob=drop_prob)
+        # ADDED - GATE MECHANISM
+        self.gate = nn.Linear(12 * hidden_size, 12 * hidden_size, bias=False)
+        self.sig = nn.Sigmoid()
+
+        # After concatenating att with self attention, hidden_size is 12 * hidden_size
+        self.mod = layers.RNNEncoder(input_size=12 * hidden_size,  # UPDATED
                                      hidden_size=hidden_size,
                                      num_layers=2,
                                      drop_prob=drop_prob)
@@ -59,7 +72,7 @@ class BiDAF(nn.Module):
         self.out = layers.BiDAFOutput(hidden_size=hidden_size,
                                       drop_prob=drop_prob)
 
-    def forward(self, cw_idxs, qw_idxs, cc_idxs, qc_idxs):  # TODO where does the cc_idxs and qc_idxs come from
+    def forward(self, cw_idxs, qw_idxs, cc_idxs, qc_idxs):
         c_mask = torch.zeros_like(cw_idxs) != cw_idxs
         q_mask = torch.zeros_like(qw_idxs) != qw_idxs
         c_len, q_len = c_mask.sum(-1), q_mask.sum(-1)
@@ -71,17 +84,33 @@ class BiDAF(nn.Module):
         if self.with_char_embed:
             c_char_emb = self.char_emb(cc_idxs)
             q_char_emb = self.char_emb(qc_idxs)
-            c_emb = torch.cat([c_emb, c_char_emb], dim=-1)  # concatenate along the last dimension (hidden_size)
-            q_emb = torch.cat([q_emb, q_char_emb], dim=-1)
+            # print("C_char_emb", c_char_emb.size())
+            # print("C_emb", c_emb.size())
+            c_emb = torch.cat([c_emb, c_char_emb], dim=2)  # concatenate along the last dimension (hidden_size)
+            q_emb = torch.cat([q_emb, q_char_emb], dim=2)
 
         c_enc = self.enc(c_emb, c_len)    # (batch_size, c_len, 2 * hidden_size)
         q_enc = self.enc(q_emb, q_len)    # (batch_size, q_len, 2 * hidden_size)
+        # print(c_enc.size())
 
-        att = self.att(c_enc, q_enc,
-                       c_mask, q_mask)    # (batch_size, c_len, 8 * hidden_size)
+        c, a, b = self.att(c_enc, q_enc,
+                           c_mask, q_mask)    # (batch_size, c_len, 8 * hidden_size)
 
-        mod = self.mod(att, c_len)        # (batch_size, c_len, 2 * hidden_size)
+        # ADDED
+        d = self.satt(a, a, c_mask)
 
-        out = self.out(att, mod, c_mask)  # 2 tensors, each (batch_size, c_len)
+        # concatenate att and satt
+        # both self_att and att size is (bs, c_len, 8 * hidden_size)
+        # att = torch.cat([c, a, c * a, c * b], dim=2)
+        final_att = torch.cat([c, a, c * a, c * b, d, a * d], dim=2)  # (bs, c_len, 12 * hidden_size)
+
+        # gate ADDED
+        gated_att = self.gate(final_att)
+        gated_att = self.sig(gated_att)
+        final_att = torch.mul(final_att, gated_att)
+
+        mod = self.mod(final_att, c_len)        # (batch_size, c_len, 2 * hidden_size)
+
+        out = self.out(final_att, mod, c_mask)  # 2 tensors, each (batch_size, c_len)
 
         return out

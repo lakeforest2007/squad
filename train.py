@@ -46,11 +46,13 @@ def main(args):
 
     # ADDED
     char_vectors = util.torch_from_json(args.char_emb_file)
+    # print("CHAR VECTOR SIZE", char_vectors.size())
+    log.info('Finished loading character vectors...')
 
     # Get model
     log.info('Building model...')
     model = BiDAF(word_vectors=word_vectors,
-                  with_char_embed=False,  # TOGGLE THIS TO BE TRUE OR FALSE FOR CHARACTER EMBEDS
+                  with_char_embed=True,  # TOGGLE THIS TO BE TRUE OR FALSE FOR CHARACTER EMBEDS
                   char_vectors=char_vectors,
                   hidden_size=args.hidden_size,
                   drop_prob=args.drop_prob)
@@ -106,8 +108,8 @@ def main(args):
                 cw_idxs = cw_idxs.to(device)
                 qw_idxs = qw_idxs.to(device)
                 # ADDED
-                cc_idxs = cc_idxs.to(device)
-                qc_idxs = qc_idxs.to(device)
+                # cc_idxs = cc_idxs.to(device)
+                # qc_idxs = qc_idxs.to(device)
 
                 batch_size = cw_idxs.size(0)
                 optimizer.zero_grad()
@@ -181,7 +183,7 @@ def evaluate(model, data_loader, device, eval_file, max_len, use_squad_v2):
             batch_size = cw_idxs.size(0)
 
             # Forward
-            log_p1, log_p2 = model(cw_idxs, qw_idxs)
+            log_p1, log_p2 = model(cw_idxs, qw_idxs, cc_idxs, qc_idxs)
             y1, y2 = y1.to(device), y2.to(device)
             loss = F.nll_loss(log_p1, y1) + F.nll_loss(log_p2, y2)
             nll_meter.update(loss.item(), batch_size)

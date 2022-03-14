@@ -17,27 +17,34 @@ class CharEmbedding(nn.Module):
     """
     Notes: 2D CNN with adaptive max-pooling
     """
-    def __init__(self, char_vectors, hidden_size, drop_prob):
+    def __init__(self, char_vectors, out_channels, drop_prob, seq_len=16):
         super(CharEmbedding, self).__init__()
         self.drop_prob = drop_prob
-        # use pre-trained character vectors loaded in from json files
         self.char_embed = nn.Embedding.from_pretrained(char_vectors)
-        self.cnn = nn.Conv2d(in_channels=char_vectors.shape[1],  # size of a character embedded vector
-                             out_channels=hidden_size,
+        self.cnn = nn.Conv2d(in_channels=64,
+                             out_channels=out_channels,
                              kernel_size=(1, 5))  # m is 1, width of filter is 5
-        # CNN returns 4D output -> (batch_size, hidden_size, seq_len, W_out)
-        # Reduce dimensionality from 4D to 3D with max pooling
-        self.max_pool = nn.AdaptiveMaxPool2d(output_size=(None, 1))  # TODO double check
+        self.max_pool = nn.AdaptiveMaxPool2d(output_size=(None, 1))  # reduce dimensionality
+
 
     def forward(self, x):
         # get character embeddings from x
         char_emb = self.char_embed(x)
+        # print("After embed:", char_emb.size())
         # apply dropout
         char_emb = F.dropout(char_emb, self.drop_prob, self.training)
+        # print("After dropout: ", char_emb.size())
         # apply CNN
+        char_emb = torch.transpose(char_emb, 1, 3)
+        char_emb = torch.transpose(char_emb, 2, 3)
+        # print("After rearrange with transpose: ", char_emb.size())
         char_emb = self.cnn(char_emb)
+        # print("After CNN: ", char_emb.size())
         # apply max-pool
         char_emb = self.max_pool(char_emb).squeeze(dim=3)
+        # print("After map pool: ", char_emb.size())
+        char_emb = torch.transpose(char_emb, 1, 2)
+        # print("After 2nd rearrange with transpose: ", char_emb.size())
         return char_emb
 
 
@@ -116,7 +123,9 @@ class RNNEncoder(nn.Module):
                  drop_prob=0.):
         super(RNNEncoder, self).__init__()
         self.drop_prob = drop_prob
-        self.rnn = nn.LSTM(input_size, hidden_size, num_layers,
+        self.rnn = nn.LSTM(input_size=input_size,
+                           hidden_size=hidden_size,
+                           num_layers=num_layers,
                            batch_first=True,
                            bidirectional=True,
                            dropout=drop_prob if num_layers > 1 else 0.)
@@ -165,27 +174,33 @@ class BiDAFAttention(nn.Module):
         self.c_weight = nn.Parameter(torch.zeros(hidden_size, 1))
         self.q_weight = nn.Parameter(torch.zeros(hidden_size, 1))
         self.cq_weight = nn.Parameter(torch.zeros(1, 1, hidden_size))
+
         for weight in (self.c_weight, self.q_weight, self.cq_weight):
             nn.init.xavier_uniform_(weight)
         self.bias = nn.Parameter(torch.zeros(1))
+
+        self.hidden_size = hidden_size
 
     def forward(self, c, q, c_mask, q_mask):
         batch_size, c_len, _ = c.size()
         q_len = q.size(1)
         s = self.get_similarity_matrix(c, q)        # (batch_size, c_len, q_len)
+
         c_mask = c_mask.view(batch_size, c_len, 1)  # (batch_size, c_len, 1)
         q_mask = q_mask.view(batch_size, 1, q_len)  # (batch_size, 1, q_len)
         s1 = masked_softmax(s, q_mask, dim=2)       # (batch_size, c_len, q_len)
         s2 = masked_softmax(s, c_mask, dim=1)       # (batch_size, c_len, q_len)
 
         # (bs, c_len, q_len) x (bs, q_len, hid_size) => (bs, c_len, hid_size)
-        a = torch.bmm(s1, q)
+
+        a = torch.bmm(s1, q)  # a is C2Q attention outputs
         # (bs, c_len, c_len) x (bs, c_len, hid_size) => (bs, c_len, hid_size)
-        b = torch.bmm(torch.bmm(s1, s2.transpose(1, 2)), c)
+        b = torch.bmm(torch.bmm(s1, s2.transpose(1, 2)), c)  # b is Q2C attention outputs
 
-        x = torch.cat([c, a, c * a, c * b], dim=2)  # (bs, c_len, 4 * hid_size)
+        # x = torch.cat([c, a, c * a, c * b], dim=2)  # (bs, c_len, 4 * hid_size)
+        # print("x size from BiDAF attention:", x.size())
 
-        return x
+        return [c, a, b]  # size of x is (64, 261, 1600)
 
     def get_similarity_matrix(self, c, q):
         """Get the "similarity matrix" between context and query (using the
@@ -212,6 +227,54 @@ class BiDAFAttention(nn.Module):
         return s
 
 
+class SelfAttention(nn.Module):
+    def __init__(self, drop_prob, hidden_size):  # hidden_size is 400
+        super(SelfAttention, self).__init__()
+        self.drop_prob = drop_prob
+        self.c_weight = nn.Parameter(torch.zeros(hidden_size, 1))
+        self.q_weight = nn.Parameter(torch.zeros(hidden_size, 1))
+        self.cq_weight = nn.Parameter(torch.zeros(1, 1, hidden_size))
+
+        for weight in (self.c_weight, self.q_weight, self.cq_weight):
+            nn.init.xavier_uniform_(weight)
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, c, q, q_mask):
+        batch_size, c_len, _ = c.size()
+        q_len = q.size(1)  # q_len same as c_len in self-attention
+
+        s = self.get_similarity_matrix(c, q)        # (batch_size, c_len, c_len)
+
+        q_mask = q_mask.view(batch_size, 1, q_len)  # (batch_size, 1, c_len)
+        s1 = masked_softmax(s, q_mask, dim=2)       # (64, c_len, c_len) - probability distribution
+
+        d = torch.bmm(s1, q)
+        # compute self attention between a and itself - a(64, 261, 400) x a(64, 261, 400)
+        # bs, c_len, hid_size = a.size()
+        # a = a.view(bs * c_len, c_len)  # (64x261, 261)
+        # d = a * a  # matrix multiplication
+        # d = d.view(bs, -1, hid_size)  # (64, 261, 400)
+
+        # a2 = a                        # a2 is (64, 261, 400)
+        # a = torch.transpose(a, 1, 2)  # a is (64, 400, 261)
+        # a1 = torch.bmm(a2, a)         # a1 is (64, 261, 261)
+        # d = torch.bmm(a1, a2)         # (64, 261, 400) - C2Q to C2Q attention outputs
+
+        return d
+
+    def get_similarity_matrix(self, c, q):
+        c_len, q_len = c.size(1), q.size(1)
+        c = F.dropout(c, self.drop_prob, self.training)  # (bs, c_len, hid_size)
+        q = F.dropout(q, self.drop_prob, self.training)  # (bs, q_len, hid_size)
+        # Shapes: (batch_size, c_len, q_len)
+        s0 = torch.matmul(c, self.c_weight).expand([-1, -1, q_len])
+        s1 = torch.matmul(q, self.q_weight).transpose(1, 2)\
+                                           .expand([-1, c_len, -1])
+        s2 = torch.matmul(c * self.cq_weight, q.transpose(1, 2))
+        s = s0 + s1 + s2 + self.bias
+        return s
+
+
 class BiDAFOutput(nn.Module):
     """Output layer used by BiDAF for question answering.
 
@@ -227,7 +290,8 @@ class BiDAFOutput(nn.Module):
     """
     def __init__(self, hidden_size, drop_prob):
         super(BiDAFOutput, self).__init__()
-        self.att_linear_1 = nn.Linear(8 * hidden_size, 1)
+        self.att_linear_1 = nn.Linear(12 * hidden_size, 1)  # UPDATED for self-attention
+        # 8 * x = 1600, 10 * x = 2000, 12 * x = 3200
         self.mod_linear_1 = nn.Linear(2 * hidden_size, 1)
 
         self.rnn = RNNEncoder(input_size=2 * hidden_size,
@@ -235,11 +299,13 @@ class BiDAFOutput(nn.Module):
                               num_layers=1,
                               drop_prob=drop_prob)
 
-        self.att_linear_2 = nn.Linear(8 * hidden_size, 1)
+        self.att_linear_2 = nn.Linear(12 * hidden_size, 1)  # UPDATED for self-attention
         self.mod_linear_2 = nn.Linear(2 * hidden_size, 1)
 
     def forward(self, att, mod, mask):
         # Shapes: (batch_size, seq_len, 1)
+        # print("SIZE OF ATT:", att.size())
+        # print("SIZE OF MOD:", mod.size())
         logits_1 = self.att_linear_1(att) + self.mod_linear_1(mod)
         mod_2 = self.rnn(mod, mask.sum(-1))
         logits_2 = self.att_linear_2(att) + self.mod_linear_2(mod_2)
